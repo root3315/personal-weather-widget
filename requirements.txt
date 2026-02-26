@@ -1,0 +1,3 @@
+# Personal Weather Widget has no external dependencies.
+# It uses only the Python standard library.
+# This file exists for tooling compatibility.

@@ -26,6 +26,7 @@ REFRESH_INTERVAL = int(os.environ.get("WEATHER_REFRESH", "300"))
 
 data_lock = Lock()
 weather_cache = {}
+active_locations = []
 
 
 def build_openweathermap_url(location, api_key, units="metric"):
@@ -50,6 +51,18 @@ def build_forecast_url(location, api_key, units="metric"):
     }
     query = urllib.parse.urlencode(params)
     return f"{base}?{query}"
+
+
+def build_geocode_url(query, api_key, limit=5):
+    """Construct the OpenWeatherMap Geocoding API request URL for location search."""
+    base = "http://api.openweathermap.org/geo/1.0/direct"
+    params = {
+        "q": query,
+        "limit": limit,
+        "appid": api_key,
+    }
+    query_str = urllib.parse.urlencode(params)
+    return f"{base}?{query_str}"
 
 
 def fetch_json(url, timeout=10):
@@ -122,6 +135,38 @@ def fetch_forecast(location, api_key, units="metric"):
                 "wind_speed": entry["wind"]["speed"],
             })
         return items
+    except Exception:
+        return []
+
+
+def search_locations(query, api_key):
+    """Search for locations matching the query using the Geocoding API."""
+    url = build_geocode_url(query, api_key)
+    try:
+        results = fetch_json(url)
+        locations = []
+        for result in results:
+            name = result.get("name", "")
+            country = result.get("country", "")
+            state = result.get("state", "")
+            lat = result.get("lat")
+            lon = result.get("lon")
+            display_name = name
+            if state:
+                display_name = f"{name}, {state}"
+            if country:
+                display_name = f"{display_name}, {country}" if display_name else country
+            search_key = f"{name},{state},{country}" if state else f"{name},{country}"
+            locations.append({
+                "name": name,
+                "display_name": display_name,
+                "search_key": search_key,
+                "country": country,
+                "state": state,
+                "lat": lat,
+                "lon": lon,
+            })
+        return locations
     except Exception:
         return []
 
@@ -224,6 +269,74 @@ def render_widget(locations_data, units):
             padding: 2rem;
         }}
         h1 {{ text-align: center; margin-bottom: 2rem; font-weight: 300; color: #fff; }}
+        .search-bar {{
+            max-width: 1200px;
+            margin: 0 auto 2rem;
+            position: relative;
+        }}
+        .search-form {{
+            display: flex;
+            gap: 0.5rem;
+            max-width: 500px;
+            margin: 0 auto;
+        }}
+        .search-input {{
+            flex: 1;
+            padding: 0.75rem 1rem;
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            border-radius: 8px;
+            background: rgba(255, 255, 255, 0.1);
+            color: #e0e0e0;
+            font-size: 1rem;
+            outline: none;
+            transition: border-color 0.2s, background 0.2s;
+        }}
+        .search-input:focus {{
+            border-color: rgba(255, 255, 255, 0.5);
+            background: rgba(255, 255, 255, 0.15);
+        }}
+        .search-input::placeholder {{ color: rgba(255, 255, 255, 0.5); }}
+        .search-btn {{
+            padding: 0.75rem 1.5rem;
+            border: none;
+            border-radius: 8px;
+            background: rgba(255, 255, 255, 0.2);
+            color: #e0e0e0;
+            font-size: 1rem;
+            cursor: pointer;
+            transition: background 0.2s;
+        }}
+        .search-btn:hover {{ background: rgba(255, 255, 255, 0.3); }}
+        .search-results {{
+            position: absolute;
+            top: 100%;
+            left: 0;
+            right: 0;
+            max-width: 500px;
+            margin: 0.5rem auto 0;
+            background: rgba(30, 30, 50, 0.95);
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.12);
+            border-radius: 8px;
+            display: none;
+            z-index: 100;
+            overflow: hidden;
+        }}
+        .search-results.active {{ display: block; }}
+        .search-result-item {{
+            padding: 0.75rem 1rem;
+            cursor: pointer;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+            transition: background 0.2s;
+        }}
+        .search-result-item:hover {{ background: rgba(255, 255, 255, 0.1); }}
+        .search-result-item:last-child {{ border-bottom: none; }}
+        .search-result-name {{ font-weight: 500; }}
+        .search-loading {{
+            padding: 1rem;
+            text-align: center;
+            opacity: 0.6;
+        }}
         .container {{
             display: grid;
             grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
@@ -296,10 +409,106 @@ def render_widget(locations_data, units):
 </head>
 <body>
     <h1>Weather Dashboard</h1>
+    <div class="search-bar">
+        <form class="search-form" id="searchForm">
+            <input type="text" class="search-input" id="searchInput" placeholder="Search for a city..." autocomplete="off">
+            <button type="submit" class="search-btn">Search</button>
+        </form>
+        <div class="search-results" id="searchResults"></div>
+    </div>
     <div class="container">{cards_html}</div>
     <div class="meta">Auto-refreshes every {REFRESH_INTERVAL}s | Units: {unit_label}</div>
     <script>
         setTimeout(() => location.reload(), {REFRESH_INTERVAL * 1000});
+
+        (function() {{
+            const form = document.getElementById('searchForm');
+            const input = document.getElementById('searchInput');
+            const resultsDiv = document.getElementById('searchResults');
+            let debounceTimer = null;
+
+            form.addEventListener('submit', function(e) {{
+                e.preventDefault();
+                const query = input.value.trim();
+                if (!query) return;
+                performSearch(query);
+            }});
+
+            input.addEventListener('input', function() {{
+                clearTimeout(debounceTimer);
+                const query = input.value.trim();
+                if (!query) {{
+                    resultsDiv.classList.remove('active');
+                    resultsDiv.innerHTML = '';
+                    return;
+                }}
+                debounceTimer = setTimeout(() => performSearch(query), 300);
+            }});
+
+            document.addEventListener('click', function(e) {{
+                if (!e.target.closest('.search-bar')) {{
+                    resultsDiv.classList.remove('active');
+                }}
+            }});
+
+            function performSearch(query) {{
+                resultsDiv.innerHTML = '<div class="search-loading">Searching...</div>';
+                resultsDiv.classList.add('active');
+
+                fetch('/api/search?q=' + encodeURIComponent(query))
+                    .then(function(resp) {{ return resp.json(); }})
+                    .then(function(data) {{
+                        if (data.error) {{
+                            resultsDiv.innerHTML = '<div class="search-loading">' + data.error + '</div>';
+                            return;
+                        }}
+                        if (!data.locations || data.locations.length === 0) {{
+                            resultsDiv.innerHTML = '<div class="search-loading">No results found</div>';
+                            return;
+                        }}
+                        resultsDiv.innerHTML = '';
+                        data.locations.forEach(function(loc) {{
+                            const item = document.createElement('div');
+                            item.className = 'search-result-item';
+                            item.innerHTML = '<span class="search-result-name">' + escapeHtml(loc.display_name) + '</span>';
+                            item.addEventListener('click', function() {{
+                                addLocation(loc.search_key);
+                            }});
+                            resultsDiv.appendChild(item);
+                        }});
+                    }})
+                    .catch(function() {{
+                        resultsDiv.innerHTML = '<div class="search-loading">Search failed</div>';
+                    }});
+            }}
+
+            function addLocation(searchKey) {{
+                resultsDiv.innerHTML = '<div class="search-loading">Adding location...</div>';
+
+                fetch('/api/add-location', {{
+                    method: 'POST',
+                    headers: {{ 'Content-Type': 'application/json' }},
+                    body: JSON.stringify({{ location: searchKey }})
+                }})
+                .then(function(resp) {{ return resp.json(); }})
+                .then(function(data) {{
+                    if (data.success) {{
+                        location.reload();
+                    }} else {{
+                        resultsDiv.innerHTML = '<div class="search-loading">Failed to add location</div>';
+                    }}
+                }})
+                .catch(function() {{
+                    resultsDiv.innerHTML = '<div class="search-loading">Request failed</div>';
+                }});
+            }}
+
+            function escapeHtml(text) {{
+                const div = document.createElement('div');
+                div.textContent = text;
+                return div.innerHTML;
+            }}
+        }})();
     </script>
 </body>
 </html>"""
@@ -321,9 +530,11 @@ def collect_all_weather(api_key, locations, units):
 
 def run_server(api_key, locations, units):
     """Start the built-in HTTP server that serves the weather widget."""
+    global active_locations
     locations_list = [l.strip() for l in locations.split(",") if l.strip()]
     if not locations_list:
         locations_list = [l.strip() for l in DEFAULT_LOCATIONS.split(",")]
+    active_locations = locations_list
 
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -331,7 +542,7 @@ def run_server(api_key, locations, units):
         def do_GET(self):
             if self.path == "/" or self.path == "/index.html":
                 with data_lock:
-                    data = collect_all_weather(api_key, locations_list, units)
+                    data = collect_all_weather(api_key, active_locations, units)
                 html = render_widget(data, units)
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -342,13 +553,59 @@ def run_server(api_key, locations, units):
                 self.send_header("Content-Type", "text/plain")
                 self.end_headers()
                 self.wfile.write(b"OK")
-            elif self.path == "/api/weather":
+            elif self.path.startswith("/api/weather"):
                 with data_lock:
-                    data = collect_all_weather(api_key, locations_list, units)
+                    data = collect_all_weather(api_key, active_locations, units)
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
                 self.wfile.write(json.dumps(data, indent=2).encode("utf-8"))
+            elif self.path.startswith("/api/search"):
+                parsed = urllib.parse.urlparse(self.path)
+                params = urllib.parse.parse_qs(parsed.query)
+                query = params.get("q", [""])[0].strip()
+                if not query:
+                    self.send_response(400)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"error": "Missing query parameter"}).encode("utf-8"))
+                    return
+                results = search_locations(query, api_key)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"locations": results}).encode("utf-8"))
+            else:
+                self.send_response(404)
+                self.send_header("Content-Type", "text/plain")
+                self.end_headers()
+                self.wfile.write(b"Not Found")
+
+        def do_POST(self):
+            if self.path == "/api/add-location":
+                content_length = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(content_length)
+                try:
+                    data = json.loads(body)
+                    location = data.get("location", "").strip()
+                    if not location:
+                        self.send_response(400)
+                        self.send_header("Content-Type", "application/json")
+                        self.end_headers()
+                        self.wfile.write(json.dumps({"error": "Missing location"}).encode("utf-8"))
+                        return
+                    with data_lock:
+                        if location not in active_locations:
+                            active_locations.append(location)
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"success": True, "location": location}).encode("utf-8"))
+                except Exception:
+                    self.send_response(400)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"error": "Invalid request"}).encode("utf-8"))
             else:
                 self.send_response(404)
                 self.send_header("Content-Type", "text/plain")
@@ -361,7 +618,7 @@ def run_server(api_key, locations, units):
 
     server = HTTPServer((HOST, PORT), WeatherHandler)
     print(f"Personal Weather Widget running on http://{HOST}:{PORT}")
-    print(f"Monitoring: {', '.join(locations_list)}")
+    print(f"Monitoring: {', '.join(active_locations)}")
     print(f"Units: {units} | Cache TTL: {CACHE_TTL}s")
     try:
         server.serve_forever()
